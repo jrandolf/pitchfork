@@ -187,6 +187,16 @@ pub enum PortError {
         pid: u32,
     },
 
+    #[error("port {port} is reserved by daemon {daemon}, which is still starting")]
+    #[diagnostic(
+        code(pitchfork::port::reserved),
+        url("https://pitchfork.jdx.dev/configuration#port"),
+        help(
+            "choose a different port, or enable auto_bump_port to automatically find an available port"
+        )
+    )]
+    Reserved { port: u16, daemon: String },
+
     #[error(
         "could not find an available port after {attempts} attempts starting from {start_port}"
     )]

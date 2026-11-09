@@ -129,6 +129,9 @@ pub struct Supervisor {
     /// reconciliation tell a supervised daemon from one whose monitor died
     /// with a previous supervisor process.
     pub(crate) monitored: std::sync::Mutex<HashMap<DaemonId, adopt::MonitorEntry>>,
+    /// Ports picked for daemons that are not ready yet. See
+    /// `lifecycle::PortReservation`.
+    pub(crate) reserved_ports: std::sync::Mutex<HashMap<u16, lifecycle::ReservedPort>>,
     /// Where to deliver output a log sink reports over IPC.
     ///
     /// A daemon whose output is captured by a sink writes nothing this process
@@ -642,6 +645,7 @@ impl Supervisor {
             lan_monitor_task: Mutex::new(None),
             flush_cancel: std::sync::Mutex::new(None),
             monitored: std::sync::Mutex::new(HashMap::new()),
+            reserved_ports: std::sync::Mutex::new(HashMap::new()),
             sink_output: std::sync::Mutex::new(HashMap::new()),
             stop_locks: Mutex::new(HashMap::new()),
             ready_checks: std::sync::Mutex::new(HashMap::new()),

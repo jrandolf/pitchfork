@@ -329,3 +329,42 @@ EOF
   kill_port "$port"
   kill_port "$((port + 1))"
 }
+
+# Two projects, such as two checkouts of one repository, start daemons that
+# expect the same port at the same time. The second start checks the port once
+# the first has resolved it, while that daemon doesn't listen yet.
+@test "concurrent starts of daemons that expect the same port pick different ports" {
+  local port
+  port="$(free_port_run 2)"
+  local http_script
+  http_script="$(script_path http_server.py)"
+  for project in one two; do
+    mkdir -p "$project"
+    cat > "$project/pitchfork.toml" <<EOF
+[daemons.web]
+run = "python3 -u $http_script 2 \$PORT"
+port = { expect = [$port], bump = 1 }
+ready_output = "Server listening"
+EOF
+  done
+
+  (cd one && pitchfork start web) &
+  local one=$!
+  wait_for_supervisor_log "daemon one/web: ports .* resolved to"
+  (cd two && pitchfork start web) &
+  local two=$!
+  local one_status=0 two_status=0
+  wait "$one" || one_status=$?
+  wait "$two" || two_status=$?
+
+  wait_for_logs one/web "Starting HTTP server on port"
+  wait_for_logs two/web "Starting HTTP server on port"
+  local ports
+  ports="$(for project in one two; do
+    read_logs "$project/web" | sed -n 's/.*Starting HTTP server on port \([0-9]*\).*/\1/p'
+  done | sort -n | tr '\n' ' ')"
+  assert_equal "$ports" "$port $((port + 1)) "
+  assert_equal "$one_status $two_status" "0 0"
+
+  pitchfork stop one/web two/web || true
+}

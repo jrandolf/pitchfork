@@ -1320,16 +1320,18 @@ impl Supervisor {
             .as_ref()
             .map(|p| p.expect.clone())
             .unwrap_or_default();
-        let (resolved_ports, effective_ready_port) = if !expected_ports.is_empty() {
+        let (resolved_ports, effective_ready_port, port_reservation) = if !expected_ports.is_empty()
+        {
             let port_cfg = opts.port.as_ref().unwrap();
             match check_ports_available(
+                id,
                 &expected_ports,
                 port_cfg.auto_bump(),
                 port_cfg.max_bump_attempts(),
             )
             .await
             {
-                Ok(resolved) => {
+                Ok((resolved, reservation)) => {
                     let ready_port = if let Some(configured_port) =
                         opts.ready_port.as_ref().and_then(|p| p.as_port())
                     {
@@ -1354,7 +1356,7 @@ impl Supervisor {
                         None
                     };
                     info!("daemon {id}: ports {expected_ports:?} resolved to {resolved:?}");
-                    (resolved, ready_port)
+                    (resolved, ready_port, Some(reservation))
                 }
                 Err(e) => {
                     error!("daemon {id}: port check failed: {e}");
@@ -1383,6 +1385,7 @@ impl Supervisor {
                                     attempts: *attempts,
                                 });
                             }
+                            PortError::Reserved { .. } => {}
                         }
                     }
                     return Ok(IpcResponse::DaemonFailed {
@@ -1410,6 +1413,7 @@ impl Supervisor {
             (
                 Vec::new(),
                 opts.ready_port.as_ref().and_then(|p| p.as_port()),
+                None,
             )
         };
 
@@ -1884,6 +1888,10 @@ impl Supervisor {
             // supervisor delivering into a channel nobody is reading. Dropped
             // explicitly once the daemon exits, before the drain below.
             let output_relay = output_relay;
+            // Dropped once the daemon is ready, when it holds its ports
+            // itself, or once it has exited: after a readiness failure, once
+            // the kill is done.
+            let mut port_reservation = port_reservation;
 
             // Merge all output sources (PTY master OR stdout+stderr, or a
             // sink's IPC reports) into a single channel.
@@ -2611,6 +2619,7 @@ impl Supervisor {
                 if ready_notified {
                     http_probe = None;
                     port_probe = None;
+                    drop(port_reservation.take());
                 }
             }
             drop(http_probe);
@@ -2713,6 +2722,7 @@ impl Supervisor {
                     time::sleep(Duration::from_millis(100)).await;
                 }
             }
+            drop(port_reservation);
 
             // Get the final exit status
             let exit_status = if let Some(status) = exit_status {
@@ -3480,21 +3490,85 @@ fn nix_to_io_error(err: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(err as i32)
 }
 
+/// Tells reservations of one daemon apart. See [`PortReservation`].
+static NEXT_RESERVATION_TOKEN: atomic::AtomicU64 = atomic::AtomicU64::new(1);
+
+/// The daemon that reserved a port, and which of its reservations did.
+pub(crate) struct ReservedPort {
+    id: DaemonId,
+    token: u64,
+}
+
+/// Ports picked for a daemon that is not ready yet, in the supervisor's
+/// `reserved_ports`. A port the daemon has not bound yet still looks free, so
+/// without this a start at the same time could pick it too. The monitoring
+/// task drops it once the daemon is ready or has exited.
+///
+/// The daemon's own reservations don't count against it: one left by the
+/// attempt it replaces (a forced start, a retry) may not be dropped yet.
+/// Dropping one removes only the ports still under its token.
+#[derive(Debug)]
+pub(crate) struct PortReservation {
+    ports: Vec<u16>,
+    token: u64,
+}
+
+impl PortReservation {
+    /// Reserve `ports` for `id`, or name a port another daemon has reserved
+    /// and that daemon. Port 0 asks the OS for any port, so it isn't reserved.
+    fn try_new(id: &DaemonId, ports: &[u16]) -> std::result::Result<Self, (u16, DaemonId)> {
+        let mut reserved = SUPERVISOR
+            .reserved_ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ports: Vec<u16> = ports.iter().copied().filter(|&p| p != 0).collect();
+        for port in &ports {
+            if let Some(holder) = reserved.get(port)
+                && holder.id != *id
+            {
+                return Err((*port, holder.id.clone()));
+            }
+        }
+        let token = NEXT_RESERVATION_TOKEN.fetch_add(1, atomic::Ordering::Relaxed);
+        for &port in &ports {
+            reserved.insert(
+                port,
+                ReservedPort {
+                    id: id.clone(),
+                    token,
+                },
+            );
+        }
+        Ok(Self { ports, token })
+    }
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        let mut reserved = SUPERVISOR
+            .reserved_ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for port in &self.ports {
+            if reserved.get(port).is_some_and(|r| r.token == self.token) {
+                reserved.remove(port);
+            }
+        }
+    }
+}
+
 /// Check if multiple ports are available and optionally auto-bump to find available ports.
 ///
 /// All ports are bumped by the same offset to maintain relative port spacing.
-/// Returns the resolved ports (either the original or bumped ones).
-/// Returns an error if any port is in use and auto_bump is disabled,
-/// or if no available ports can be found after max attempts.
+/// Returns the resolved ports (either the original or bumped ones), reserved
+/// for `id`. Returns an error if any port is in use or reserved and auto_bump
+/// is disabled, or if no available ports can be found after max attempts.
 async fn check_ports_available(
+    id: &DaemonId,
     expected_ports: &[u16],
     auto_bump: bool,
     max_attempts: u32,
-) -> Result<Vec<u16>> {
-    if expected_ports.is_empty() {
-        return Ok(Vec::new());
-    }
-
+) -> Result<(Vec<u16>, PortReservation)> {
     for bump_offset in 0..=max_attempts {
         // Use wrapping_add to handle overflow correctly - ports wrap around at 65535
         let candidate_ports: Vec<u16> = expected_ports
@@ -3524,8 +3598,7 @@ async fn check_ports_available(
             //
             // NOTE: This check has a time-of-check-to-time-of-use (TOCTOU) race condition.
             // Another process could grab the port between our check and the daemon actually
-            // binding. This is inherent to the approach and acceptable for our use case
-            // since we're primarily detecting conflicts with already-running daemons.
+            // binding. Another start by this supervisor can't: the ports are reserved below.
             if let Some(address) = port_bind_conflict(port).await {
                 all_available = false;
                 conflicting_port = Some((port, address));
@@ -3544,10 +3617,24 @@ async fn check_ports_available(
                 }
                 .into());
             }
-            if bump_offset > 0 {
-                info!("ports {expected_ports:?} bumped by {bump_offset} to {candidate_ports:?}");
+            match PortReservation::try_new(id, &candidate_ports) {
+                Ok(reservation) => {
+                    if bump_offset > 0 {
+                        info!(
+                            "ports {expected_ports:?} bumped by {bump_offset} to {candidate_ports:?}"
+                        );
+                    }
+                    return Ok((candidate_ports, reservation));
+                }
+                Err((port, daemon)) if !auto_bump => {
+                    return Err(PortError::Reserved {
+                        port,
+                        daemon: daemon.to_string(),
+                    }
+                    .into());
+                }
+                Err(_) => continue,
             }
-            return Ok(candidate_ports);
         }
 
         // Port is in use
@@ -3893,12 +3980,57 @@ mod port_conflict_tests {
         TcpSocket, check_ports_available, listener_match, pick_port_owner, port_bind_conflict,
         shown_address,
     };
+    use crate::daemon_id::DaemonId;
     use crate::error::PortError;
     use std::net::{IpAddr, SocketAddr};
 
     /// Held by a test that forks continuously, and by any test whose sockets
     /// a forked child must not keep after the test drops them.
     static FORKS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn port_test_id(name: &str) -> DaemonId {
+        DaemonId::new("port-conflict-test", name)
+    }
+
+    /// The daemon whose reservation keeps `port` from `id`, if any.
+    async fn reserved_by(id: &DaemonId, port: u16) -> Option<String> {
+        let err = check_ports_available(id, &[port], false, 0).await.err()?;
+        match err.downcast_ref::<PortError>() {
+            Some(PortError::Reserved { port: p, daemon }) if *p == port => Some(daemon.clone()),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_port_reserved_for_one_daemon_is_not_picked_for_another() {
+        let _forks = FORKS.lock().await;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (one, two) = (port_test_id("one"), port_test_id("two"));
+
+        let (ports, first) = check_ports_available(&one, &[port], false, 0)
+            .await
+            .unwrap();
+        assert_eq!(ports, [port]);
+        assert_eq!(reserved_by(&two, port).await, Some(one.to_string()));
+        let (bumped, _) = check_ports_available(&two, &[port], true, 10)
+            .await
+            .unwrap();
+        assert_ne!(bumped, [port]);
+
+        // A daemon's start may reserve its ports again before the attempt it
+        // replaces drops the reservation, which then leaves them reserved.
+        let (_, second) = check_ports_available(&one, &[port], false, 0)
+            .await
+            .unwrap();
+        drop(first);
+        assert_eq!(reserved_by(&two, port).await, Some(one.to_string()));
+        drop(second);
+        assert_eq!(reserved_by(&two, port).await, None);
+    }
 
     #[tokio::test]
     async fn a_taken_port_is_reported_with_its_address_and_holder() {
@@ -3914,7 +4046,9 @@ mod port_conflict_tests {
             "{address}"
         );
 
-        let err = check_ports_available(&[port], false, 0).await.unwrap_err();
+        let err = check_ports_available(&port_test_id("taken"), &[port], false, 0)
+            .await
+            .unwrap_err();
         match err.downcast_ref::<PortError>() {
             Some(PortError::InUse {
                 port: p,

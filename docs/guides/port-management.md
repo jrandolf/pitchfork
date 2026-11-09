@@ -28,7 +28,9 @@ port = [8080, 8443]
 ```
 
 Pitchfork checks availability, injects the resolved ports into the daemon's environment,
-and reports a conflict if a port is occupied and bumping is disabled.
+and reports a conflict if a port is occupied and bumping is disabled. A port resolved
+for another daemon counts as occupied until that daemon is ready or exits, so daemons
+started at the same time get different ports.
 
 **Your application must use the assigned port.** A program that hardcodes a port
 will not move just because pitchfork sets `PORT`. For example:
